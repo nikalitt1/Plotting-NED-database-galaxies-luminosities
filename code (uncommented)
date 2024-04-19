@@ -1,0 +1,182 @@
+import csv
+import numpy as np
+import matplotlib.pyplot as plt
+from astropy.coordinates import SkyCoord
+from astroquery.ipac.ned import Ned
+from astroquery.exceptions import RemoteServiceError
+from concurrent.futures import ThreadPoolExecutor
+
+# Constants
+DISTANCE_MODULUS_FACTOR = 4.28275e9
+SOLAR_ABSOLUTE_MAGNITUDE = 4.83
+
+# Cache for galaxy coordinates
+galaxy_coords_cache = {}
+
+def query_galaxy_info(galaxy_name):
+    try:
+        # Check the cache first
+        if galaxy_name in galaxy_coords_cache:
+            return galaxy_coords_cache[galaxy_name]
+
+        galaxy_coords = Ned.query_object(galaxy_name)
+        galaxy_coords_cache[galaxy_name] = galaxy_coords
+
+        return galaxy_coords
+    except RemoteServiceError as e:
+        print(f"Error querying NED for galaxy {galaxy_name}: {e}")
+        return None
+
+def calculate_distance(redshift):
+    return redshift * DISTANCE_MODULUS_FACTOR
+
+def calculate_luminosity(apparent_magnitude, distance):
+    try:
+        apparent_magnitude = float(apparent_magnitude)
+        absolute_magnitude = apparent_magnitude - 5 * np.log10((distance) / 10)
+        luminosity = 10**((-absolute_magnitude) / 2.512)
+        return luminosity
+    except ValueError:
+        return None
+
+def extract_info(result_table):
+    if result_table:
+        index = np.argmax(result_table['Redshift'])
+        name = result_table['Object Name'][index]
+        velocity = result_table['Velocity'][index]
+        apparent_magnitude = result_table['Magnitude and Filter'][index]
+        distance = result_table['Redshift'][index]
+        
+        luminosity = calculate_luminosity(apparent_magnitude, distance * DISTANCE_MODULUS_FACTOR)
+        return {'Name': name, 'Velocity': velocity, 'Luminosity': luminosity} if luminosity is not None else None
+    else:
+        return None
+
+def calculate_luminosity_factor(target_dist, galaxy_dist, angular_separation):
+    theta1 = 90 - angular_separation
+    B = galaxy_dist * np.sin(theta1)
+    c = np.sqrt(galaxy_dist**2 - B**2)
+    d = target_dist - B
+    e = np.sqrt(c**2 + d**2)
+    theta2 = np.arcsin(d / e)
+    factor = (theta1 + theta2) / 180
+    return factor
+
+def find_close_galaxies(target_galaxy, galaxy_csv, max_angular_sep, min_redshift=0.0):
+    target_coords = Ned.query_object(target_galaxy)
+
+    if target_coords is None or len(target_coords) == 0:
+        print(f"No results found for target galaxy {target_galaxy}. Skipping.")
+        return []
+
+    target_ra, target_dec, target_redshift = target_coords['RA'][0], target_coords['DEC'][0], target_coords['Redshift'][0]
+    target_skycoord = SkyCoord(ra=target_ra, dec=target_dec, unit='deg', frame='icrs')
+
+    close_galaxies = []
+
+    with open(galaxy_csv, 'r') as csvfile:
+        reader = csv.DictReader(csvfile)
+        galaxy_names = [row['Name'] for row in reader]
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        galaxy_coords_list = list(executor.map(query_galaxy_info, galaxy_names))
+
+    for galaxy_coords in galaxy_coords_list:
+        if galaxy_coords is None or len(galaxy_coords) == 0:
+            continue
+
+        try:
+            galaxy_ra, galaxy_dec, galaxy_redshift, galaxy_velocity = \
+                galaxy_coords['RA'][0], galaxy_coords['DEC'][0], galaxy_coords['Redshift'][0], galaxy_coords['Velocity'][0]
+
+            if galaxy_redshift <= min_redshift:
+                continue
+
+            galaxy_skycoord = SkyCoord(ra=galaxy_ra, dec=galaxy_dec, unit='deg', frame='icrs')
+            angular_sep = target_skycoord.separation(galaxy_skycoord).deg
+
+            if angular_sep < max_angular_sep:
+                target_distance, galaxy_distance = calculate_distance(target_redshift), calculate_distance(galaxy_redshift)
+
+                if galaxy_distance < target_distance:
+                    galaxy_info = extract_info(galaxy_coords)
+                    if galaxy_info:
+                        luminosity_factor = calculate_luminosity_factor(target_distance, galaxy_distance, angular_sep)
+                        luminosity = galaxy_info['Luminosity'] * luminosity_factor
+                        galaxy_info['Luminosity'] = luminosity
+                        close_galaxies.append(galaxy_info)
+        except Exception as e:
+            print(f"Error processing galaxy {galaxy_coords['Object Name'][0]}: {e}")
+
+    print(f"Galaxies close to {target_galaxy}: {close_galaxies}")
+    print(f"Number of galaxies within {max_angular_sep} degrees with redshift above {min_redshift}: {len(close_galaxies)}")
+
+    return close_galaxies
+
+def main():
+    galaxy_csv_file = 'IC100_names.csv'
+    max_angular_separation = 90
+
+    total_luminosities = []
+    target_velocities = []
+    close_galaxies_counts = []  # Store the count of close galaxies for each data point
+
+    with open(galaxy_csv_file, 'r') as csvfile:
+        reader = csv.DictReader(csvfile)
+        target_galaxies = [row['Name'] for row in reader]
+
+    for target_galaxy in target_galaxies:
+        target_galaxy_coords = Ned.query_object(target_galaxy)
+        close_galaxies = find_close_galaxies(target_galaxy, galaxy_csv_file, max_angular_separation)
+
+        if close_galaxies:
+            target_luminosity = calculate_luminosity(target_galaxy_coords['Magnitude and Filter'][0],
+                                                      calculate_distance(target_galaxy_coords['Redshift'][0]))
+
+            total_luminosity = sum(galaxy['Luminosity'] for galaxy in close_galaxies if 'Luminosity' in galaxy)
+            if target_luminosity is not None:
+                total_luminosity += target_luminosity * 0.5
+
+            total_luminosities.append(total_luminosity)
+            target_velocity = float(target_galaxy_coords['Velocity'][0])
+            target_velocities.append(target_velocity)
+            close_galaxies_counts.append(len(close_galaxies))
+
+    print("=" * 40)
+
+    # Scatter plot
+    plt.scatter(total_luminosities, target_velocities, marker='o', edgecolor='b', label='data')
+    plt.ylabel('Target Galaxy Recession Velocity (km/s)')
+    plt.xlabel('Total Luminosity of Close Galaxies (solar luminosities)')
+    plt.title('Scatter Plot and 2D Histogram of Total Luminosities with Close Galaxies Count')
+    plt.legend()
+    plt.show()
+
+    # 2D histogram with color representing the number of close galaxies
+    plt.hist2d(total_luminosities, target_velocities, bins=(20, 20), cmap='viridis', alpha=0.5,
+               weights=close_galaxies_counts)  # Use weights parameter for the count
+    plt.colorbar(label='Number of Close Galaxies')
+    plt.xlabel('Total Luminosity of Close Galaxies (solar luminosities)')
+    plt.ylabel('Target Galaxy Recession Velocity (km/s)')
+
+    plt.show()
+
+    # Save x (total_luminosities) and y (target_velocities) values to separate CSV files
+    x_csv_file = 'total_luminosities100.csv'
+    y_csv_file = 'target_velocities.csv'
+
+    with open(x_csv_file, 'w', newline='') as x_csv_file:
+        x_csv_writer = csv.writer(x_csv_file)
+        x_csv_writer.writerow(['Total Luminosity'])
+        x_csv_writer.writerows([[value] for value in total_luminosities])
+
+    with open(y_csv_file, 'w', newline='') as y_csv_file:
+        y_csv_writer = csv.writer(y_csv_file)
+        y_csv_writer.writerow(['Target Velocity'])
+        y_csv_writer.writerows([[value] for value in target_velocities])
+
+    print(f"Total luminosities have been saved to {x_csv_file}")
+    print(f"Target velocities have been saved to {y_csv_file}")
+
+if __name__ == "__main__":
+    main()
